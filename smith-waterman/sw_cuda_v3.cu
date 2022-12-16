@@ -11,9 +11,8 @@
 #define PEN_MATCH 1
 #define PEN_MISMATCH -1
 
-#define D 0
-#define X 1
-#define Y 2
+#define VAL 0
+#define J   1
 
 #define CHECK(call)                                                                       \
     {                                                                                     \
@@ -34,12 +33,6 @@
             exit(EXIT_FAILURE);                                                           \
         }                                                                                 \
     }
-
-typedef struct max_supp_s {
-	int v[3];
-	int i[3];
-	int j[3];
-} max_supp_t;
 
 double get_time() // function that returns the time of day in seconds
 {
@@ -112,91 +105,90 @@ __device__ int setDirScore(char * query, char * reference, int ** sc_mat, char *
 	return score;
 }
 
-__global__ void sw_GPU(char ** query, char ** reference, int *** sc_mat_list, char *** dir_mat_list, int * res, char ** simple_rev_cigar, max_supp_t * max_supp) {    
-	// srand(time(NULL)); 
-	int n = blockIdx.x;
-	
+__global__ void sw_GPU(char ** query, char ** reference, int *** sc_mat_list, char *** dir_mat_list, int * res, char ** simple_rev_cigar) {    
+    int n = blockIdx.x;
+
 	int ** sc_mat = sc_mat_list[n];
-	char ** dir_mat = dir_mat_list[n];
+    char ** dir_mat = dir_mat_list[n];
 
-	int score;
-	int max, maxi, maxj;
+    int i, j, progress;
+    int score;
+    int max, maxi, maxj;
 
-	// max_supp_t max_tmp = max_supp[n];
-    __shared__ max_supp_t max_tmp;  
+    clock_t start, end;
 
-	// initialize the scoring matrix and direction matrix to 0 
-    if(threadIdx.x == 0) {
-        max_tmp.v[D] = PEN_INS;
-        max_tmp.v[X] = PEN_INS;
-        max_tmp.v[Y] = PEN_INS;
+    __shared__ int max_supp[S_LEN][2];
 
-        for (int i = 0; i < S_LEN + 1; i++) {
-            for (int j = 0; j < S_LEN + 1; j++) {
-                sc_mat[i][j] = 0;
-                dir_mat[i][j] = 0;
-            }
-        }
-
-        // Necessary initialization for vertical comparison of scores
-        max_tmp.i[Y] = INT_MAX;
-        max_tmp.j[Y] = INT_MAX;
+    start = clock();
+    for(i=0; i<S_LEN; i++) {
+        sc_mat[i][threadIdx.x] = 0;
+        dir_mat[i][threadIdx.x] = 0;
     }
+    // Additional instruction for the remaining row
+    if(threadIdx.x == S_LEN-1) {
+        sc_mat[i][S_LEN] = 0;
+        dir_mat[i][S_LEN] = 0;
+    }
+    end = clock();
+    if(threadIdx.x == 0 && blockIdx.x == 0) {printf("%d\n", end - start);};
 
-	// compute the alignment
-	for (int i = 1; i < S_LEN; i++) {
-		// Handle diagonal cells
-		if(threadIdx.x == 0) {
-            score = setDirScore(query[n], reference[n], sc_mat, dir_mat, i, i);
-            if(score > max_tmp.v[D]) {
-                max_tmp.v[D] = score; max_tmp.i[D] = i; max_tmp.j[D] = i;
-            }
+    start = clock();
+    progress = 1;
+    for(i=1; i<S_LEN*2; i++) {
+        if(threadIdx.x < i && progress <= S_LEN) {
+            score = setDirScore(query[n], reference[n], sc_mat, dir_mat, threadIdx.x+1, progress);
+            progress++;
         }
-		// Handle vertical/horizontal cells
         __syncthreads();
-		for(int j = i+1; j < S_LEN; j++) {
-            if(threadIdx.x == 0) {
-                score = setDirScore(query[n], reference[n], sc_mat, dir_mat, i, j);
-                if(score > max_tmp.v[X]) {
-                    max_tmp.v[X] = score; max_tmp.i[X] = i; max_tmp.j[X] = j;
-                }
-            } else if(threadIdx.x == 1) {
-                score = setDirScore(query[n], reference[n], sc_mat, dir_mat, j, i);
-                if(score > max_tmp.v[Y] || (score == max_tmp.v[Y] && j<max_tmp.i[Y])) {
-                    max_tmp.v[Y]= score; max_tmp.i[Y] = j; max_tmp.j[Y] = i;
-                }
-            }
-		}
-	}
+    }
+    end = clock();
+    if(threadIdx.x == 0 && blockIdx.x == 0) {printf("%d\n", end - start);};
 
-    if(threadIdx.x == 0) {
-        int eq_maxes_idx[3];
-        int eq_maxes_count = 0;
-        int min_ij_score = INT_MAX;
-        int ij_score;
-        max = PEN_INS;
-        maxi = -1; maxj = -1;
-        // Find maximum value
-        for(int i=0; i<3; i++)
-            if(max_tmp.v[i] > max)
-                max = max_tmp.v[i];
-        for(int i=0; i<3; i++)
-            if(max_tmp.v[i] == max) {
-                eq_maxes_idx[eq_maxes_count] = i;
-                eq_maxes_count++;
-            }
-        for(int i=0; i<eq_maxes_count; i++) {
-            ij_score = max_tmp.i[eq_maxes_idx[i]]*(S_LEN)+max_tmp.j[eq_maxes_idx[i]];
-            if(ij_score < min_ij_score) {
-                min_ij_score = ij_score;
-                maxi = max_tmp.i[eq_maxes_idx[i]];
-                maxj = max_tmp.j[eq_maxes_idx[i]];
-            }
+
+    start = clock();
+    max_supp[threadIdx.x][VAL] = sc_mat[threadIdx.x][1];
+    max_supp[threadIdx.x][J] = 1;
+    for(i=2; i<S_LEN; i++) {
+        if(sc_mat[threadIdx.x][i] > max_supp[threadIdx.x][VAL]) {
+            max_supp[threadIdx.x][VAL] = sc_mat[threadIdx.x][i];
+            max_supp[threadIdx.x][J] = i;
         }
+    }
+        
+    __syncthreads();        
+    if(threadIdx.x == 0) {
+        max = max_supp[0][VAL];
+        maxi = threadIdx.x;
+        maxj = max_supp[0][J];
+        for(i=1; i<S_LEN; i++) {
+            if(max_supp[i][VAL] > max) {
+                max = max_supp[i][VAL];
+                maxi = i;
+                maxj = max_supp[i][J];
+            }
+        }    
 
         res[n] = sc_mat[maxi][maxj];
-        backtrace(simple_rev_cigar[n], dir_mat, maxi, maxj, S_LEN * 2);
+        backtrace(simple_rev_cigar[n], dir_mat, maxi, maxj, S_LEN*2);
+
+        // if(blockIdx.x == 0) {
+        //     printf("Score matrix\t\tDirection matrix\n");
+        //     for(i=0; i<S_LEN; i++) {
+        //         for(j=0; j<S_LEN+1; j++) {
+        //             printf("%d ", sc_mat[i][j]);
+        //         }
+        //         printf("\t");
+        //         for(j=0; j<S_LEN+1; j++) {
+        //             printf("%d ", dir_mat[i][j]);
+        //         }
+        //         printf("\n");
+        //     }
+        //     printf("max = %d, maxi = %d, maxj = %d\n", max, maxi, maxj);
+        // }
     }
+    end = clock();
+    if(threadIdx.x == 0 && blockIdx.x == 0) {printf("%d\n", end - start);};
+
 }
 
 
@@ -278,7 +270,22 @@ __host__ void sw_CPU(char ** query, char ** reference, int ** sc_mat, char ** di
 		}
 		res[n] = sc_mat[maxi][maxj];
 		backtrace_CPU(simple_rev_cigar[n], dir_mat, maxi, maxj, S_LEN * 2);
-	}
+
+        // if(n == 0) {
+        //     printf("Score matrix\t\tDirection matrix\n");
+        //     for(int i=0; i<S_LEN; i++) {
+        //         for(int j=0; j<S_LEN+1; j++) {
+        //             printf("%d ", sc_mat[i][j]);
+        //         }
+        //         printf("\t");
+        //         for(int j=0; j<S_LEN+1; j++) {
+        //             printf("%d ", dir_mat[i][j]);
+        //         }
+        //         printf("\n");
+        //     }
+        //     printf("max = %d, maxi = %d, maxj = %d\n", max, maxi, maxj);
+        // }
+    }
 }
 
 int main(int argc, char * argv[]) {
@@ -378,18 +385,14 @@ int main(int argc, char * argv[]) {
     }
     cudaMemcpy (d_simple_rev_cigar, d_simple_rev_cigar_ptrs, N*sizeof(char *), cudaMemcpyHostToDevice);
 
-    max_supp_t * d_max_supp;
-    cudaMalloc(&d_max_supp, N*sizeof(max_supp_t));
-
-
     // Blocks and threads schema for GPU execution
     dim3 blocksPerGrid(N, 1, 1);
-    dim3 threadsPerBlock(2, 1, 1);
+    dim3 threadsPerBlock(S_LEN, 1, 1);
 
     // Execution on GPU started
     time_start = get_time();
 
-    sw_GPU<<<blocksPerGrid, threadsPerBlock>>>(d_query, d_reference, d_sc_mat_list, d_dir_mat_list, d_res, d_simple_rev_cigar, d_max_supp);
+    sw_GPU<<<blocksPerGrid, threadsPerBlock>>>(d_query, d_reference, d_sc_mat_list, d_dir_mat_list, d_res, d_simple_rev_cigar);
     CHECK_KERNELCALL();
     cudaDeviceSynchronize();
 
@@ -442,15 +445,6 @@ int main(int argc, char * argv[]) {
 		printf("[OK]\t'rev_cigar' is consistent\n");
 	else{
 		printf("[ERR]\t'rev_cigar' is inconsistent [err on: %d]\n", i);
-		// printf("Comparison:\n");
-		// for(j=0; j<(S_LEN*2); j++) {
-		// 	printf("%d ", gpu_simple_rev_cigar[i][j]);
-		// }
-		// printf("\n");
-		// for(j=0; j<(S_LEN*2); j++) {
-		// 	printf("%d ", h_simple_rev_cigar[i][j]);
-		// }
-		// printf("\n");
 	}
 
 
