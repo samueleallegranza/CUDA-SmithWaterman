@@ -3,8 +3,8 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define S_LEN 512
-#define N 1000
+#define S_LEN 32
+#define N 4
 
 #define PEN_INS -2
 #define PEN_DEL -2
@@ -105,80 +105,57 @@ __device__ int setDirScore(char * query, char * reference, int ** sc_mat, char *
 	return score;
 }
 
-__global__ void sw_GPU(char ** query, char ** reference, int *** sc_mat_list, char *** dir_mat_list, int * res, char ** simple_rev_cigar) {    
-    int n = blockIdx.x;
+__device__ void sw_block_calc(char * query, char * reference, int ** sc_mat, char ** dir_mat, int start_x, int start_y, int side_len, int threadBlockIdx) {    
+	int i, j, j_end;
+	int progress, progress_tot;
 
-	int ** sc_mat = sc_mat_list[n];
-    char ** dir_mat = dir_mat_list[n];
-
-    int i, progress;
-    int score;
-    int max, maxi, maxj;
-
-    // clock_t start, end;
-
-    __shared__ int max_supp[S_LEN][2];
-
-    for(i=0; i<S_LEN; i++) {
-        sc_mat[i][threadIdx.x] = 0;
-        dir_mat[i][threadIdx.x] = 0;
-    }
-    // Additional instruction for the remaining row
-    if(threadIdx.x == S_LEN-1) {
-        sc_mat[i][S_LEN] = 0;
-        dir_mat[i][S_LEN] = 0;
-    }
-
-    progress = 1;
-    for(i=1; i<S_LEN*2; i++) {
-        if(threadIdx.x < i && progress <= S_LEN) {
-            score = setDirScore(query[n], reference[n], sc_mat, dir_mat, threadIdx.x+1, progress);
-            progress++;
-        }
+    i = start_y + threadBlockIdx;
+    j = start_x;
+	j_end = start_x + side_len - 1;
+	progress_tot = (side_len*2)-1;
+	for(progress=0; progress < progress_tot; progress++) {
+		if(threadBlockIdx <= progress && j <= j_end && (i < S_LEN && j < S_LEN)) {
+			setDirScore(query, reference, sc_mat, dir_mat, i+1, j+1);
+			j++;
+		}
         __syncthreads();
     }
+}
 
+__global__ void kernel_launch(char ** query, char ** reference, int *** sc_mat, char *** dir_mat, int * res, char ** simple_rev_cigar, int blocks_per_area, int side_blocks) {
+	int areaIdx, blockAreaIdx, threadBlockIdx;
+	int i, margin;
+	int start_x, start_y;
 
-    max_supp[threadIdx.x][VAL] = sc_mat[threadIdx.x][1];
-    max_supp[threadIdx.x][J] = 1;
-    for(i=2; i<S_LEN; i++) {
-        if(sc_mat[threadIdx.x][i] > max_supp[threadIdx.x][VAL]) {
-            max_supp[threadIdx.x][VAL] = sc_mat[threadIdx.x][i];
-            max_supp[threadIdx.x][J] = i;
-        }
-    }
-        
-    __syncthreads();        
-    if(threadIdx.x == 0) {
-        max = max_supp[0][VAL];
-        maxi = threadIdx.x;
-        maxj = max_supp[0][J];
-        for(i=1; i<S_LEN; i++) {
-            if(max_supp[i][VAL] > max) {
-                max = max_supp[i][VAL];
-                maxi = i;
-                maxj = max_supp[i][J];
-            }
-        }    
+	areaIdx = (int) blockIdx.x / blocks_per_area;
+	blockAreaIdx = blockIdx.x % blocks_per_area;
+	threadBlockIdx = threadIdx.x;
 
-        res[n] = sc_mat[maxi][maxj];
-        backtrace(simple_rev_cigar[n], dir_mat, maxi, maxj, S_LEN*2);
+	start_x = (blockAreaIdx % side_blocks) * blockDim.x;
+	start_y = ((int) blockAreaIdx / side_blocks) * blockDim.x;
 
-        // if(blockIdx.x == 0) {
-        //     printf("Score matrix\t\tDirection matrix\n");
-        //     for(i=0; i<S_LEN; i++) {
-        //         for(j=0; j<S_LEN+1; j++) {
-        //             printf("%d ", sc_mat[i][j]);
-        //         }
-        //         printf("\t");
-        //         for(j=0; j<S_LEN+1; j++) {
-        //             printf("%d ", dir_mat[i][j]);
-        //         }
-        //         printf("\n");
-        //     }
-        //     printf("max = %d, maxi = %d, maxj = %d\n", max, maxi, maxj);
-        // }
-    }
+	if(blockAreaIdx == 0 && threadBlockIdx == 0) {
+		for(int k=0; k<S_LEN+1; k++) {
+			dir_mat[areaIdx][0][k] = 0;
+			sc_mat[areaIdx][0][k] = 0;
+			dir_mat[areaIdx][k][0] = 0;
+			sc_mat[areaIdx][k][0] = 0;
+		}
+	}
+
+	// if(areaIdx == 0 && threadBlockIdx == 0) {
+	// 	printf("[BL %d][TH %d] start_x=%d; start_y=%d\n", blockAreaIdx, threadBlockIdx, start_x, start_y);
+	// }
+
+	margin = 0;
+	for(i=0; i<side_blocks; i++) {
+		if(((blockAreaIdx-i)%(side_blocks-1))==0 && blockAreaIdx <= margin && blockAreaIdx >= i) {
+			if(areaIdx == 0 && threadBlockIdx == 0) {printf("[DIAG IDX %d] [BL %d][TH %d] start_x=%d; start_y=%d\n", i, blockAreaIdx, threadBlockIdx, start_x, start_y);}
+			sw_block_calc(query[areaIdx], reference[areaIdx], sc_mat[areaIdx], dir_mat[areaIdx], start_x, start_y, side_blocks, threadBlockIdx);
+		}
+		margin += side_blocks;
+		__syncthreads();
+	}
 }
 
 
@@ -228,9 +205,9 @@ __host__ void sw_CPU(char ** query, char ** reference, int ** sc_mat, char ** di
 			}
 		}
 		// compute the alignment
-		for (int i = 1; i < S_LEN; i++)
+		for (int i = 1; i < S_LEN + 1; i++)
 		{
-			for (int j = 1; j < S_LEN; j++)
+			for (int j = 1; j < S_LEN + 1; j++)
 			{
 				// compare the sequences characters
 				int comparison = (query[n][i - 1] == reference[n][j - 1]) ? match : mismatch;
@@ -282,6 +259,7 @@ int main(int argc, char * argv[]) {
 	srand(time(NULL)); 
     char alphabet[5] = {'A', 'C', 'G', 'T', 'N'};
     double time_start, time_stop;
+    int BLOCKSIZE = atoi(argv[1]);
 
     // Host memory allocation and initialization for sequences (randomly generated)
     char **h_query = (char **)malloc(N * sizeof(char *));
@@ -376,16 +354,18 @@ int main(int argc, char * argv[]) {
     cudaMemcpy (d_simple_rev_cigar, d_simple_rev_cigar_ptrs, N*sizeof(char *), cudaMemcpyHostToDevice);
 
     // Blocks and threads schema for GPU execution
-    dim3 blocksPerGrid(N, 1, 1);
-    dim3 threadsPerBlock(S_LEN, 1, 1);
+	int side_blocks = (int) ceil((float) S_LEN / BLOCKSIZE);
+	int blocks_per_area = side_blocks * side_blocks;
+	dim3 blocksPerGrid(blocks_per_area*N, 1, 1);
+    dim3 threadsPerBlock(BLOCKSIZE, 1, 1);
+	printf("BLOCKSIZE = %d;  blocks_per_area = %d\n", BLOCKSIZE, blocks_per_area);
 
     // Execution on GPU started
     time_start = get_time();
 
-    sw_GPU<<<blocksPerGrid, threadsPerBlock>>>(d_query, d_reference, d_sc_mat_list, d_dir_mat_list, d_res, d_simple_rev_cigar);
+    kernel_launch<<<blocksPerGrid, threadsPerBlock>>>(d_query, d_reference, d_sc_mat_list, d_dir_mat_list, d_res, d_simple_rev_cigar, blocks_per_area, side_blocks);
     CHECK_KERNELCALL();
-	// The following function adds A LOT of latency! Don't use it for benchmarking purposes
-    // cudaDeviceSynchronize();
+    cudaDeviceSynchronize();
 
     // Execution on GPU ended
     time_stop = get_time();

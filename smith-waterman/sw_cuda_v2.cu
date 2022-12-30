@@ -391,7 +391,8 @@ int main(int argc, char * argv[]) {
 
     sw_GPU<<<blocksPerGrid, threadsPerBlock>>>(d_query, d_reference, d_sc_mat_list, d_dir_mat_list, d_res, d_simple_rev_cigar, d_max_supp);
     CHECK_KERNELCALL();
-    cudaDeviceSynchronize();
+	// The following function adds A LOT of latency! Don't use it for benchmarking purposes
+    // cudaDeviceSynchronize();
 
     // Execution on GPU ended
     time_stop = get_time();
