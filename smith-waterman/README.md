@@ -5,7 +5,7 @@ Here is a summary of the different versions that can be found in this repository
 
 - `sw_cuda_v2` : Solution that implements the *2-Threads* approach.
 - `sw_cuda_v3` : Solution that implements the *L-Threads* approach. 
-- `sw_cuda_v2` : Solution that implements the *L-Threads* approach, with the difference of spanning the matrices into vectors.
+- `sw_cuda_v3.1` : Solution that implements the *L-Threads* approach, with the difference of spanning the matrices into vectors.
 
 Please note that `sw_cuda_v0` and `sw_cuda_v1` should not be taken in consideration. 
 
